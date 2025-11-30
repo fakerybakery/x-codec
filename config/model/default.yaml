@@ -14,9 +14,9 @@ codec_decoder:
   hidden_dim: 1024
   depth: 12
   heads: 16
-  pos_meb_dim: 64 
+  pos_meb_dim: 64
   vq_num_quantizers: 1
-  vq_dim: 2048 #1024 2048
+  vq_dim: 1024  # reduced from 2048 since we removed semantic features
   vq_commit_weight: 0.25
   vq_weight_init: False
   vq_full_commit_loss: False

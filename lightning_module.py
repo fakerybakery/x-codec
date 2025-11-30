@@ -1,5 +1,5 @@
 import os
- 
+
 import random
 import hydra
 import numpy as np
@@ -9,13 +9,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import pytorch_lightning as pl
-from vq import CodecEncoder,  CodecDecoderVocos 
+from vq import CodecEncoder,  CodecDecoderVocos
 from module import HiFiGANMultiPeriodDiscriminator, SpecDiscriminator
 from criterions import GANLoss, MultiResolutionMelSpectrogramLoss, MultiResolutionSTFTLoss
 from common.schedulers import WarmupLR
-from transformers import AutoModel
-from vq.module import SemanticDecoder,SemanticEncoder
-from transformers import AutoFeatureExtractor, Wav2Vec2BertModel
 import sys
 sys.path.append('./eval_tools/tools/speaker_verification')    # We use wavlm_large_finetune as a vadidation metric during training, https://github.com/microsoft/UniSpeech/tree/main/downstreams/speaker_verification
 from  verification import init_model
@@ -99,28 +96,12 @@ class CodecLightningModule(pl.LightningModule):
         # self.CodecEnc = torch.compile(self.CodecEnc)
         # self.generator.backbone = torch.compile(self.generator )
         # self.mel_conv = torch.compile(self.mel_conv)
- 
-        self.model_spk = model_spk .eval()
 
-        # self.semantic_model = AutoModel.from_pretrained("microsoft/wavlm-large")
-        # self.semantic_model.eval()
-        # self.semantic_model.requires_grad_(False)
+        self.model_spk = model_spk.eval()
 
- 
-        self.fc_prior = nn.Linear(1024 + 1024, deccfg.vq_dim,   )
-        self.fc_post_a = nn.Linear(deccfg.vq_dim,  deccfg.hidden_dim )
-        self.fc_post_s = nn.Linear(deccfg.vq_dim,   1024)
-
-        self.SemanticDecoder_module = SemanticDecoder(1024, 1024, 1024)
-        self.SemanticEncoder_module = SemanticEncoder(1024, 1024, 1024)
-        self.semantic_model = Wav2Vec2BertModel.from_pretrained("facebook/w2v-bert-2.0", output_hidden_states=True)
-        self.semantic_model.eval()
-        self.semantic_model.requires_grad_(False)
-        # self.register_buffer('mel_basis', mel_basis)
-
-        # self.perception_model = AutoModel.from_pretrained("facebook/wav2vec2-large-xlsr-53")
-        # self.perception_model.eval()
-        # self.perception_model.requires_grad_(False)
+        # Project encoder output (1024) to vq_dim, then back to hidden_dim for decoder
+        self.fc_prior = nn.Linear(1024, deccfg.vq_dim)
+        self.fc_post_a = nn.Linear(deccfg.vq_dim, deccfg.hidden_dim)
 
     def construct_criteria(self):
         cfg = self.cfg.train
@@ -145,61 +126,37 @@ class CodecLightningModule(pl.LightningModule):
 
     def forward(self, batch):
         wav = batch['wav']
-        feats= batch['feats']
-        
-        vq_emb = self.CodecEnc(wav.unsqueeze(1))
-        vq_emb = vq_emb.transpose(1, 2)
 
-        with torch.no_grad():
-            semantic_target = self.semantic_model(feats[:,0,:,:])
+        # Encode audio
+        vq_emb = self.CodecEnc(wav.unsqueeze(1))  # [B, 1024, T]
 
-            semantic_target = semantic_target.hidden_states[16]
-            semantic_target = semantic_target.detach()
+        # Project to VQ dimension
+        vq_emb = self.fc_prior(vq_emb.transpose(1, 2)).transpose(1, 2)  # [B, vq_dim, T]
 
-        semantic_target = semantic_target.transpose(1, 2)
-        semantic_target_processed = self.SemanticEncoder_module(semantic_target)
-        # 拼接语义嵌入和编码器输出
-        vq_emb = torch.cat([semantic_target_processed, vq_emb], dim=1)
-        vq_emb = self.fc_prior(vq_emb.transpose(1, 2)).transpose(1, 2)
-
+        # Quantize
         vq_post_emb, vq_code, vq_loss = self.generator(vq_emb, vq=True)
-        semantic_recon = self.fc_post_s(vq_post_emb.transpose(1, 2)).transpose(1, 2)
-        semantic_recon = self.SemanticDecoder_module(semantic_recon)
 
- 
-        y_ ,_ = self.generator(
-            self.fc_post_a(vq_post_emb.transpose(1, 2)) ,
+        # Decode to audio
+        y_, _ = self.generator(
+            self.fc_post_a(vq_post_emb.transpose(1, 2)),
             vq=False
         )
         y = wav.unsqueeze(1)
 
-        # gt_perceptual = self.perception_model(wav.squeeze(1), output_hidden_states=True) .hidden_states
-        # gen_perceptual = self.perception_model(y_.squeeze(1), output_hidden_states=True) .hidden_states
-
-        # gt_perceptual_se = gt_perceptual[10:22]
-        # gen_perceptual_se = gen_perceptual[10:22]
-
-        # perceptual_se_loss = [tensor1 - tensor2 for tensor1, tensor2 in zip(gt_perceptual_se, gen_perceptual_se)]
-
-        # # 使用列表推导式逐元素相减
-        # perceptual_se_loss_l2 = [F.mse_loss(tensor1.detach(), tensor2) for tensor1, tensor2 in zip(gt_perceptual_se, gen_perceptual_se)]
-        # perceptual_se_loss_l2 =torch.stack(perceptual_se_loss_l2).mean()
         output = {
             'gt_wav': y,
             'gen_wav': y_,
             'vq_loss': vq_loss,
             'vq_code': vq_code,
-            'semantic_recon_loss': F.mse_loss(semantic_recon, semantic_target),
-            # 'perceptual_se_loss_l2': perceptual_se_loss_l2,
- 
         }
         return output
 
     @torch.inference_mode()
     def inference(self, wav):
-        vq_emb = self.CodecEnc(wav.unsqueeze(1))
+        vq_emb = self.CodecEnc(wav.unsqueeze(1))  # [B, 1024, T]
+        vq_emb = self.fc_prior(vq_emb.transpose(1, 2)).transpose(1, 2)  # [B, vq_dim, T]
         vq_post_emb, vq_code, vq_loss = self.generator(vq_emb, vq=True)
-        y_ = self.generator(vq_post_emb, vq=False).squeeze(1)  # [B, T]
+        y_ = self.generator(self.fc_post_a(vq_post_emb.transpose(1, 2)), vq=False)[0].squeeze(1)  # [B, T]
         return y_
 
     def compute_disc_loss(self, batch, output):
@@ -239,9 +196,6 @@ class CodecLightningModule(pl.LightningModule):
     def compute_gen_loss(self, batch, output):
         y, y_ = output['gt_wav'], output['gen_wav']
         vq_loss, vq_code = output['vq_loss'], output['vq_code']
-        semantic_recon_loss = output['semantic_recon_loss']
-        # perceptual_se_loss_l2 = output['perceptual_se_loss_l2']
-        # x_feat_recon_loss = output['x_feat_recon_loss']
         gen_loss = 0.0
         self.set_discriminator_gradients(False)
         output_dict = {}
@@ -292,14 +246,6 @@ class CodecLightningModule(pl.LightningModule):
             gen_loss += vq_loss
             output_dict['vq_loss'] = vq_loss
 
-        # Semantic reconstruction loss
-        output_dict['semantic_recon_loss'] = semantic_recon_loss
-        gen_loss += output_dict['semantic_recon_loss'] * cfg.lambdas.lambda_semantic_loss
-
-        # Perceptual loss
-        # output_dict['perceptual_se_loss_l2'] = perceptual_se_loss_l2
-        # gen_loss += output_dict['perceptual_se_loss_l2'] * cfg.lambdas.lambda_perceptual_loss
-        
         self.set_discriminator_gradients(True)
         output_dict['gen_loss'] = gen_loss
         return output_dict
@@ -387,19 +333,14 @@ class CodecLightningModule(pl.LightningModule):
 
         # 判别器参数
         disc_params = self.discriminator.parameters()
-        # if hasattr(self, 'spec_discriminator'):
         disc_params = chain(disc_params, self.spec_discriminator.parameters())
 
         # 生成器参数
         gen_params = chain(
             self.CodecEnc.parameters(),
             self.generator.parameters(),
-            # self.mel_conv.parameters(),
             self.fc_prior.parameters(),
             self.fc_post_a.parameters(),
-            self.fc_post_s.parameters(),
-            self.SemanticDecoder_module.parameters(),
-            self.SemanticEncoder_module.parameters()
         )
 
         # 优化器

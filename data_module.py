@@ -1,5 +1,5 @@
 import os
- 
+
 import re
 import torch
 import torch.nn as nn
@@ -14,10 +14,8 @@ from torch.utils.data import Dataset, DataLoader
 import hydra
 import utils
 import torchaudio
-from transformers import AutoFeatureExtractor
 from torchaudio.transforms import Resample
 from tqdm import tqdm
-from torchaudio.transforms import Resample
 class DataModule(pl.LightningDataModule):
     def __init__(self, cfg):
         super().__init__()
@@ -51,7 +49,7 @@ class DataModule(pl.LightningDataModule):
         pass
 
 class FSDataset(Dataset):
-    """Dataset batching wav, mel 
+    """Dataset batching wav, mel
     and other acoustic features
 
     Args:
@@ -63,13 +61,11 @@ class FSDataset(Dataset):
         self.cfg = cfg
         self.phase_cfg = cfg.dataset.get(phase)
         self.ocwd = hydra.utils.get_original_cwd()
-        
+
         self.sr = cfg.preprocess.audio.sr
-        
-        # self.filelist = utils.read_filelist(join(self.ocwd, self.phase_cfg.filelist))
+
         self.filelist = self.get_filelist(self.phase_cfg.filelist)
         self.min_audio_length = cfg.dataset.min_audio_length
-        self.feature_extractor = AutoFeatureExtractor.from_pretrained("facebook/w2v-bert-2.0")
     def __len__(self):
         return len(self.filelist)
 
@@ -84,48 +80,33 @@ class FSDataset(Dataset):
         return flist
 
     def __getitem__(self, idx):
-        # (  wavpath,fid) = self.filelist[idx]
-        wavpath  = self.filelist[idx]
+        wavpath = self.filelist[idx]
         wavpath_full = join(self.cfg.preprocess.datasets.LibriSpeech.root, wavpath)
-        # wav = self.load_wav(wavpath)
-        # wav = torch.from_numpy(wav)
- 
-        wav,sr=torchaudio.load(wavpath_full) 
- 
-                 
-        if sr != 16000:
-            wav = Resample(sr, 16000)(wav)
-        wav = wav[0,:]
+
+        wav, sr = torchaudio.load(wavpath_full)
+
+        if sr != self.sr:
+            wav = Resample(sr, self.sr)(wav)
+        wav = wav[0, :]
         length = wav.shape[0]
-        # length = wav.shape[1]
+
         if length < self.min_audio_length:
             wav = F.pad(wav, (0, self.min_audio_length - length))
             length = wav.shape[0]
-        i = random.randint(0, length-self.min_audio_length)
-        wav = wav[i:i+self.min_audio_length]
+        i = random.randint(0, length - self.min_audio_length)
+        wav = wav[i:i + self.min_audio_length]
 
-        wav_pad = F.pad(wav, (160, 160))
-        feat = self.feature_extractor(wav_pad, sampling_rate=16000, return_tensors="pt") .data['input_features']
         out = {
- 
             'wav': wav,
-            'feat': feat,
-            # 'paths': wavpath_full
         }
-        
+
         return out
-    
+
     def collate_fn(self, bs):
- 
         wavs = [b['wav'] for b in bs]
         wavs = torch.stack(wavs)
-        feats = [b['feat'] for b in bs]
-        feats = torch.stack(feats)
         out = {
- 
-            'wav': wavs,  
-            'feats': feats,
-            # 'paths': [b['paths'] for b in bs]
+            'wav': wavs,
         }
         return out
 
